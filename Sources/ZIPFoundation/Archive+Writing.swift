@@ -2,7 +2,7 @@
 //  Archive+Writing.swift
 //  ZIPFoundation
 //
-//  Copyright © 2017-2020 Thomas Zoechling, https://www.peakstep.com and the ZIP Foundation project authors.
+//  Copyright © 2017-2021 Thomas Zoechling, https://www.peakstep.com and the ZIP Foundation project authors.
 //  Released under the MIT License.
 //
 //  See https://github.com/weichsel/ZIPFoundation/blob/master/LICENSE for license information.
@@ -20,32 +20,50 @@ extension Archive {
     ///
     /// - Parameters:
     ///   - path: The path that is used to identify an `Entry` within the `Archive` file.
-    ///   - baseURL: The base URL of the `Entry` to add.
+    ///   - baseURL: The base URL of the resource to add.
     ///              The `baseURL` combined with `path` must form a fully qualified file URL.
     ///   - compressionMethod: Indicates the `CompressionMethod` that should be applied to `Entry`.
     ///                        By default, no compression will be applied.
     ///   - bufferSize: The maximum size of the write buffer and the compression buffer (if needed).
     ///   - progress: A progress object that can be used to track or cancel the add operation.
     /// - Throws: An error if the source file cannot be read or the receiver is not writable.
-    public func addEntry(with path: String, relativeTo baseURL: URL, compressionMethod: CompressionMethod = .none,
+    public func addEntry(with path: String, relativeTo baseURL: URL,
+                         compressionMethod: CompressionMethod = .none,
+                         bufferSize: UInt32 = defaultWriteChunkSize, progress: Progress? = nil) throws {
+        let fileURL = baseURL.appendingPathComponent(path)
+
+        try self.addEntry(with: path, fileURL: fileURL, compressionMethod: compressionMethod,
+                          bufferSize: bufferSize, progress: progress)
+    }
+
+    /// Write files, directories or symlinks to the receiver.
+    ///
+    /// - Parameters:
+    ///   - path: The path that is used to identify an `Entry` within the `Archive` file.
+    ///   - fileURL: An absolute file URL referring to the resource to add.
+    ///   - compressionMethod: Indicates the `CompressionMethod` that should be applied to `Entry`.
+    ///                        By default, no compression will be applied.
+    ///   - bufferSize: The maximum size of the write buffer and the compression buffer (if needed).
+    ///   - progress: A progress object that can be used to track or cancel the add operation.
+    /// - Throws: An error if the source file cannot be read or the receiver is not writable.
+    public func addEntry(with path: String, fileURL: URL, compressionMethod: CompressionMethod = .none,
                          bufferSize: UInt32 = defaultWriteChunkSize, progress: Progress? = nil) throws {
         let fileManager = FileManager()
-        let entryURL = baseURL.appendingPathComponent(path)
-        guard fileManager.itemExists(at: entryURL) else {
-            throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: entryURL.path])
+        guard fileManager.itemExists(at: fileURL) else {
+            throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: fileURL.path])
         }
-        let type = try FileManager.typeForItem(at: entryURL)
+        let type = try FileManager.typeForItem(at: fileURL)
         // symlinks do not need to be readable
-        guard type == .symlink || fileManager.isReadableFile(atPath: entryURL.path) else {
+        guard type == .symlink || fileManager.isReadableFile(atPath: fileURL.path) else {
             throw CocoaError(.fileReadNoPermission, userInfo: [NSFilePathErrorKey: url.path])
         }
-        let modDate = try FileManager.fileModificationDateTimeForItem(at: entryURL)
-        let uncompressedSize = type == .directory ? 0 : try FileManager.fileSizeForItem(at: entryURL)
-        let permissions = try FileManager.permissionsForItem(at: entryURL)
+        let modDate = try FileManager.fileModificationDateTimeForItem(at: fileURL)
+        let uncompressedSize = type == .directory ? 0 : try FileManager.fileSizeForItem(at: fileURL)
+        let permissions = try FileManager.permissionsForItem(at: fileURL)
         var provider: Provider
         switch type {
         case .file:
-            let entryFileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: entryURL.path)
+            let entryFileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: fileURL.path)
             guard let entryFile: UnsafeMutablePointer<FILE> = fopen(entryFileSystemRepresentation, "rb") else {
                 throw CocoaError(.fileNoSuchFile)
             }
@@ -64,7 +82,7 @@ extension Archive {
                               progress: progress, provider: provider)
         case .symlink:
             provider = { _, _ -> Data in
-                let linkDestination = try fileManager.destinationOfSymbolicLink(atPath: entryURL.path)
+                let linkDestination = try fileManager.destinationOfSymbolicLink(atPath: fileURL.path)
                 let linkFileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: linkDestination)
                 let linkLength = Int(strlen(linkFileSystemRepresentation))
                 let linkBuffer = UnsafeBufferPointer(start: linkFileSystemRepresentation, count: linkLength)
@@ -131,7 +149,7 @@ extension Archive {
             let centralDir = try self.writeCentralDirectoryStructure(localFileHeader: localFileHeader,
                                                                      relativeOffset: offset,
                                                                      externalFileAttributes: externalAttributes)
-            if startOfCD > UINT32_MAX { throw ArchiveError.invalidStartOfCentralDirectoryOffset }
+            if startOfCD > UInt32.max { throw ArchiveError.invalidStartOfCentralDirectoryOffset }
             endOfCentralDirRecord = try self.writeEndOfCentralDirectory(centralDirectoryStructure: centralDir,
                                                                         startOfCentralDirectory: UInt32(startOfCD),
                                                                         operation: .add)
@@ -150,16 +168,9 @@ extension Archive {
     ///   - progress: A progress object that can be used to track or cancel the remove operation.
     /// - Throws: An error if the `Entry` is malformed or the receiver is not writable.
     public func remove(_ entry: Entry, bufferSize: UInt32 = defaultReadChunkSize, progress: Progress? = nil) throws {
-		let manager = FileManager()
-        let tempDir = self.uniqueTemporaryDirectoryURL()
-        defer { try? manager.removeItem(at: tempDir) }
-		let uniqueString = ProcessInfo.processInfo.globallyUniqueString
-		let tempArchiveURL =  tempDir.appendingPathComponent(uniqueString)
-        do { try manager.createParentDirectoryStructure(for: tempArchiveURL) } catch {
-			throw ArchiveError.unwritableArchive }
-        guard let tempArchive = Archive(url: tempArchiveURL, accessMode: .create) else {
-            throw ArchiveError.unwritableArchive
-        }
+        guard self.accessMode != .read else { throw ArchiveError.unwritableArchive }
+        let (tempArchive, tempDir) = try self.makeTempArchive()
+        defer { tempDir.map { try? FileManager().removeItem(at: $0) } }
         progress?.totalUnitCount = self.totalUnitCountForRemoving(entry)
         var centralDirectoryData = Data()
         var offset = 0
@@ -193,44 +204,44 @@ extension Archive {
         tempArchive.endOfCentralDirectoryRecord = endOfCentralDirectoryRecord
         self.endOfCentralDirectoryRecord = endOfCentralDirectoryRecord
         fflush(tempArchive.archiveFile)
-        try self.replaceCurrentArchiveWithArchive(at: tempArchive.url)
+        try self.replaceCurrentArchive(with: tempArchive)
     }
 
     // MARK: - Helpers
 
-    func uniqueTemporaryDirectoryURL() -> URL {
-        #if swift(>=5.0) || os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
-        if let tempDir = try? FileManager().url(for: .itemReplacementDirectory, in: .userDomainMask,
-                                                appropriateFor: self.url, create: true) {
-            return tempDir
-        }
-        #endif
-
-        return URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(
-            ProcessInfo.processInfo.globallyUniqueString)
-    }
-
-    func replaceCurrentArchiveWithArchive(at URL: URL) throws {
+    func replaceCurrentArchive(with archive: Archive) throws {
         fclose(self.archiveFile)
-        let fileManager = FileManager()
-        #if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
-        do {
-            _ = try fileManager.replaceItemAt(self.url, withItemAt: URL)
-        } catch {
+        if self.isMemoryArchive {
+            #if swift(>=5.0)
+            guard let data = archive.data,
+                  let config = Archive.configureMemoryBacking(for: data, mode: .update) else {
+                throw ArchiveError.unwritableArchive
+            }
+
+            self.archiveFile = config.file
+            self.memoryFile = config.memoryFile
+            self.endOfCentralDirectoryRecord = config.endOfCentralDirectoryRecord
+            #endif
+        } else {
+            let fileManager = FileManager()
+            #if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+            do {
+                _ = try fileManager.replaceItemAt(self.url, withItemAt: archive.url)
+            } catch {
+                _ = try fileManager.removeItem(at: self.url)
+                _ = try fileManager.moveItem(at: archive.url, to: self.url)
+            }
+            #else
             _ = try fileManager.removeItem(at: self.url)
-            _ = try fileManager.moveItem(at: URL, to: self.url)
+            _ = try fileManager.moveItem(at: archive.url, to: self.url)
+            #endif
+            let fileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: self.url.path)
+            self.archiveFile = fopen(fileSystemRepresentation, "rb+")
         }
-        #else
-        _ = try fileManager.removeItem(at: self.url)
-        _ = try fileManager.moveItem(at: URL, to: self.url)
-        #endif
-        let fileSystemRepresentation = fileManager.fileSystemRepresentation(withPath: self.url.path)
-        self.archiveFile = fopen(fileSystemRepresentation, "rb+")
     }
 
     private func writeLocalFileHeader(path: String, compressionMethod: CompressionMethod,
-                                      size: (uncompressed: UInt32, compressed: UInt32),
-                                      checksum: CRC32,
+                                      size: (uncompressed: UInt32, compressed: UInt32), checksum: CRC32,
                                       modificationDateTime: (UInt16, UInt16)) throws -> LocalFileHeader {
         // We always set Bit 11 in generalPurposeBitFlag, which indicates an UTF-8 encoded path.
         guard let fileNameData = path.data(using: .utf8) else { throw ArchiveError.invalidEntryPath }
@@ -326,14 +337,22 @@ extension Archive {
                                             operation: ModifyOperation) throws -> EndOfCentralDirectoryRecord {
         var record = self.endOfCentralDirectoryRecord
         let countChange = operation.rawValue
-        var dataLength = centralDirectoryStructure.extraFieldLength
-        dataLength += centralDirectoryStructure.fileNameLength
-        dataLength += centralDirectoryStructure.fileCommentLength
-        let centralDirectoryDataLengthChange = operation.rawValue * (Int(dataLength) + CentralDirectoryStructure.size)
+        var dataLength = Int(centralDirectoryStructure.extraFieldLength)
+        dataLength += Int(centralDirectoryStructure.fileNameLength)
+        dataLength += Int(centralDirectoryStructure.fileCommentLength)
+        let centralDirectoryDataLengthChange = operation.rawValue * (dataLength + CentralDirectoryStructure.size)
         var updatedSizeOfCentralDirectory = Int(record.sizeOfCentralDirectory)
         updatedSizeOfCentralDirectory += centralDirectoryDataLengthChange
-        let numberOfEntriesOnDisk = UInt16(Int(record.totalNumberOfEntriesOnDisk) + countChange)
-        let numberOfEntriesInCentralDirectory = UInt16(Int(record.totalNumberOfEntriesInCentralDirectory) + countChange)
+        let numberOfEntriesOnDiskInt = Int(record.totalNumberOfEntriesOnDisk) + countChange
+        guard numberOfEntriesOnDiskInt <= UInt16.max else {
+            throw ArchiveError.invalidNumberOfEntriesOnDisk
+        }
+        let numberOfEntriesOnDisk = UInt16(numberOfEntriesOnDiskInt)
+        let numberOfEntriesInCentralDirectoryInt = Int(record.totalNumberOfEntriesInCentralDirectory) + countChange
+        guard numberOfEntriesInCentralDirectoryInt <= UInt16.max else {
+            throw ArchiveError.invalidNumberOfEntriesInCentralDirectory
+        }
+        let numberOfEntriesInCentralDirectory = UInt16(numberOfEntriesInCentralDirectoryInt)
         record = EndOfCentralDirectoryRecord(record: record, numberOfEntriesOnDisk: numberOfEntriesOnDisk,
                                              numberOfEntriesInCentralDirectory: numberOfEntriesInCentralDirectory,
                                              updatedSizeOfCentralDirectory: UInt32(updatedSizeOfCentralDirectory),
@@ -342,13 +361,40 @@ extension Archive {
         return record
     }
 
-    private func rollback(_ localFileHeaderStart: Int,
-                          _ existingCentralDirectoryData: Data,
+    private func rollback(_ localFileHeaderStart: Int, _ existingCentralDirectoryData: Data,
                           _ endOfCentralDirRecord: EndOfCentralDirectoryRecord) throws {
         fflush(self.archiveFile)
         ftruncate(fileno(self.archiveFile), off_t(localFileHeaderStart))
         fseek(self.archiveFile, localFileHeaderStart, SEEK_SET)
         _ = try Data.write(chunk: existingCentralDirectoryData, to: self.archiveFile)
         _ = try Data.write(chunk: endOfCentralDirRecord.data, to: self.archiveFile)
+    }
+
+    func makeTempArchive() throws -> (Archive, URL?) {
+        var archive: Archive
+        var url: URL?
+        if self.isMemoryArchive {
+            #if swift(>=5.0)
+            guard let tempArchive = Archive(data: Data(), accessMode: .create,
+                                            preferredEncoding: self.preferredEncoding) else {
+                throw ArchiveError.unwritableArchive
+            }
+            archive = tempArchive
+            #else
+            fatalError("Memory archives are unsupported.")
+            #endif
+        } else {
+            let manager = FileManager()
+            let tempDir = URL.temporaryReplacementDirectoryURL(for: self)
+            let uniqueString = ProcessInfo.processInfo.globallyUniqueString
+            let tempArchiveURL = tempDir.appendingPathComponent(uniqueString)
+            try manager.createParentDirectoryStructure(for: tempArchiveURL)
+            guard let tempArchive = Archive(url: tempArchiveURL, accessMode: .create) else {
+                throw ArchiveError.unwritableArchive
+            }
+            archive = tempArchive
+            url = tempDir
+        }
+        return (archive, url)
     }
 }

@@ -2,13 +2,21 @@
 //  Data+Compression.swift
 //  ZIPFoundation
 //
-//  Copyright © 2017-2020 Thomas Zoechling, https://www.peakstep.com and the ZIP Foundation project authors.
+//  Copyright © 2017-2021 Thomas Zoechling, https://www.peakstep.com and the ZIP Foundation project authors.
 //  Released under the MIT License.
 //
 //  See https://github.com/weichsel/ZIPFoundation/blob/master/LICENSE for license information.
 //
 
 import Foundation
+
+/// The compression method of an `Entry` in a ZIP `Archive`.
+public enum CompressionMethod: UInt16 {
+    /// Indicates that an `Entry` has no compression applied to its contents.
+    case none = 0
+    /// Indicates that contents of an `Entry` have been compressed with a zlib compatible Deflate algorithm.
+    case deflate = 8
+}
 
 /// An unsigned 32-Bit Integer representing a checksum.
 public typealias CRC32 = UInt32
@@ -26,7 +34,7 @@ public typealias Consumer = (_ data: Data) throws -> Void
 public typealias Provider = (_ position: Int, _ size: Int) throws -> Data
 
 /// The lookup table used to calculate `CRC32` checksums.
-public let crcTable: [UInt32] = [
+let crcTable: [CRC32] = [
     0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419,
     0x706af48f, 0xe963a535, 0x9e6495a3, 0x0edb8832, 0x79dcb8a4,
     0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07,
@@ -89,34 +97,34 @@ extension Data {
     /// Calculate the `CRC32` checksum of the receiver.
     ///
     /// - Parameter checksum: The starting seed.
-    /// - Returns: The checksum calcualted from the bytes of the receiver and the starting seed.
+    /// - Returns: The checksum calculated from the bytes of the receiver and the starting seed.
     public func crc32(checksum: CRC32) -> CRC32 {
         // The typecast is necessary on 32-bit platforms because of
         // https://bugs.swift.org/browse/SR-1774
-        let mask = 0xffffffff as UInt32
-        let bufferSize = self.count/MemoryLayout<UInt8>.size
+        let mask = 0xffffffff as CRC32
         var result = checksum ^ mask
         #if swift(>=5.0)
         crcTable.withUnsafeBufferPointer { crcTablePointer in
             self.withUnsafeBytes { bufferPointer in
-                let bytePointer = bufferPointer.bindMemory(to: UInt8.self)
-                for bufferIndex in 0..<bufferSize {
-                    let byte = bytePointer[bufferIndex]
-                    let index = Int((result ^ UInt32(byte)) & 0xff)
+                var bufferIndex = 0
+                while bufferIndex < self.count {
+                    let byte = bufferPointer[bufferIndex]
+                    let index = Int((result ^ CRC32(byte)) & 0xff)
                     result = (result >> 8) ^ crcTablePointer[index]
+                    bufferIndex += 1
                 }
             }
         }
         #else
         self.withUnsafeBytes { (bytes) in
-            let bins = stride(from: 0, to: bufferSize, by: 256)
+            let bins = stride(from: 0, to: self.count, by: 256)
             for bin in bins {
                 for binIndex in 0..<256 {
                     let byteIndex = bin + binIndex
-                    guard byteIndex < bufferSize else { break }
+                    guard byteIndex < self.count else { break }
 
                     let byte = bytes[byteIndex]
-                    let index = Int((result ^ UInt32(byte)) & 0xff)
+                    let index = Int((result ^ CRC32(byte)) & 0xff)
                     result = (result >> 8) ^ crcTable[index]
                 }
             }
@@ -166,6 +174,7 @@ extension Data {
 import Compression
 
 extension Data {
+
     static func process(operation: compression_stream_operation, size: Int, bufferSize: Int, skipCRC32: Bool = false,
                         provider: Provider, consumer: Consumer) throws -> CRC32 {
         var crc32 = CRC32(0)
@@ -186,10 +195,7 @@ extension Data {
             if stream.src_size == 0 {
                 do {
                     sourceData = try provider(position, Swift.min((size - position), bufferSize))
-                    if let sourceData = sourceData {
-                        position += sourceData.count
-                        stream.src_size = sourceData.count
-                    }
+                    position += stream.prepare(for: sourceData)
                 } catch { throw error }
             }
             if let sourceData = sourceData {
@@ -214,6 +220,16 @@ extension Data {
             }
         } while status == COMPRESSION_STATUS_OK
         return crc32
+    }
+}
+
+private extension compression_stream {
+
+    mutating func prepare(for sourceData: Data?) -> Int {
+        guard let sourceData = sourceData else { return 0 }
+
+        self.src_size = sourceData.count
+        return sourceData.count
     }
 }
 
